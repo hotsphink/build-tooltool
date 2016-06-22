@@ -38,6 +38,8 @@ import urllib2
 import urlparse
 import zipfile
 
+from collections import namedtuple
+from StringIO import StringIO
 from subprocess import PIPE
 from subprocess import Popen
 
@@ -75,6 +77,9 @@ class DigestMismatchException(ExceptionWithFilename):
 
 class MissingFileException(ExceptionWithFilename):
     pass
+
+
+ManifestContents = namedtuple('ManifestContents', ['includes', 'files'])
 
 
 class FileRecord(object):
@@ -195,50 +200,55 @@ class FileRecordJSONEncoder(json.JSONEncoder):
             return self.encode_file_record(f)
 
 
-class FileRecordJSONDecoder(json.JSONDecoder):
+class ManifestContentJSONDecoder(json.JSONDecoder):
 
-    """I help the json module materialize a FileRecord from
-    a JSON file.  I understand FileRecords and lists of
-    FileRecords.  I ignore things that I don't expect for now"""
+    """I help the json module materialize a FileRecord from a JSON file. I
+    understand FileRecords, lists of FileRecords, and whole manifests (with
+    'includes' and 'files' keys). All of these return a full ManifestContents
+    object, with a list of FileRecords. Unexpected items will be returned
+    unmodified, as if they were FileRecords. (So in a list, they will be mixed
+    in with the valid FileRecords.)"""
     # TODO: make this more explicit in what it's looking for
     # and error out on unexpected things
 
-    def process_file_records(self, obj):
-        if isinstance(obj, list):
-            record_list = []
-            for i in obj:
-                record = self.process_file_records(i)
-                if issubclass(type(record), FileRecord):
-                    record_list.append(record)
-            return record_list
+    def process_file_record(self, obj):
+        if not isinstance(obj, dict):
+            return obj
+
         required_fields = [
             'filename',
             'size',
             'algorithm',
             'digest',
         ]
-        if isinstance(obj, dict):
-            missing = False
-            for req in required_fields:
-                if req not in obj:
-                    missing = True
-                    break
+        for req in required_fields:
+            if req not in obj:
+                return obj
 
-            if not missing:
-                unpack = obj.get('unpack', False)
-                visibility = obj.get('visibility', None)
-                setup = obj.get('setup')
-                rv = FileRecord(
-                    obj['filename'], obj['size'], obj['digest'], obj['algorithm'],
-                    unpack, visibility, setup)
-                log.debug("materialized %s" % rv)
-                return rv
-        return obj
+        unpack = obj.get('unpack', False)
+        visibility = obj.get('visibility', None)
+        setup = obj.get('setup')
+        rv = FileRecord(
+            obj['filename'], obj['size'], obj['digest'], obj['algorithm'],
+            unpack, visibility, setup)
+        log.debug("materialized %s" % rv)
+        return rv
 
     def decode(self, s):
         decoded = json.JSONDecoder.decode(self, s)
-        rv = self.process_file_records(decoded)
-        return rv
+        if isinstance(decoded, list):
+            # List of file records
+            return ManifestContents(files=[self.process_file_record(data) for data in decoded],
+                                    includes=[])
+        elif 'files' in decoded:
+            # Whole manifest
+            return ManifestContents(
+                files=[self.process_file_record(data) for data in decoded['files']],
+                includes=decoded.get('includes', []))
+        else:
+            # Assume a single file record
+            return ManifestContents(files=[self.process_file_record(decoded)],
+                                    includes=[])
 
 
 class Manifest(object):
@@ -284,37 +294,48 @@ class Manifest(object):
     def validate(self):
         return all(i.validate() for i in self.file_records)
 
-    def load(self, data_file, fmt='json'):
+    def load_file(self, filename, fmt='json'):
+        with open(filename, 'r') as f:
+            self.load(f, filename, fmt)
+            log.debug("loaded manifest from file '%s'" % filename)
+
+    def load(self, data_file, context=None, fmt='json'):
         assert fmt in self.valid_formats
         if fmt == 'json':
             try:
-                self.file_records.extend(
-                    json.load(data_file, cls=FileRecordJSONDecoder))
+                content = json.load(data_file, cls=ManifestContentJSONDecoder)
+                for submanifest in content.includes:
+                    if context is None:
+                        # Path must be absolute or relative to cwd.
+                        fullpath = submanifest
+                    else:
+                        fullpath = os.path.join(os.path.dirname(context), submanifest)
+                    subcontent = Manifest()
+                    subcontent.load_file(fullpath, fmt)
+                    self.file_records.extend(subcontent.file_records)
+                self.file_records.extend(content.files)
             except ValueError:
                 raise InvalidManifest("trying to read invalid manifest file")
 
-    def loads(self, data_string, fmt='json'):
-        assert fmt in self.valid_formats
-        if fmt == 'json':
-            try:
-                self.file_records.extend(
-                    json.loads(data_string, cls=FileRecordJSONDecoder))
-            except ValueError:
-                raise InvalidManifest("trying to read invalid manifest file")
+    def loads(self, data_string, context=None, fmt='json'):
+        self.load(StringIO(data_string), context, fmt)
 
-    def dump(self, output_file, fmt='json'):
+    def dump(self, output_file, fmt='json', includes=None):
         assert fmt in self.valid_formats
         if fmt == 'json':
-            rv = json.dump(
-                self.file_records, output_file, indent=0, cls=FileRecordJSONEncoder,
-                separators=(',', ': '))
+            if includes is None:
+                out = self.file_records
+            else:
+                out = {'includes': includes, 'files': self.file_records}
+            rv = json.dump(out, output_file, indent=0, cls=FileRecordJSONEncoder,
+                           separators=(',', ': '))
             print >> output_file, ''
             return rv
 
-    def dumps(self, fmt='json'):
-        assert fmt in self.valid_formats
-        if fmt == 'json':
-            return json.dumps(self.file_records, cls=FileRecordJSONEncoder)
+    def dumps(self, fmt='json', includes=None):
+        sio = StringIO()
+        self.dump(sio, fmt=fmt, includes=includes)
+        return sio.getvalue()
 
 
 def digest_file(f, a):
@@ -346,9 +367,8 @@ def open_manifest(manifest_file):
     """I know how to take a filename and load it into a Manifest object"""
     if os.path.exists(manifest_file):
         manifest = Manifest()
-        with open(manifest_file) as f:
-            manifest.load(f)
-            log.debug("loaded manifest from file '%s'" % manifest_file)
+        manifest.load_file(manifest_file)
+        log.debug("loaded manifest from file '%s'" % manifest_file)
         return manifest
     else:
         log.debug("tried to load absent file '%s' as manifest" % manifest_file)

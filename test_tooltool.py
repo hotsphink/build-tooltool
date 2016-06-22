@@ -274,8 +274,10 @@ class TestFileRecordJSONCodecs(BaseFileRecordListTest):
     def test_decode(self):
         json_string = json.dumps(
             self.test_record, cls=tooltool.FileRecordJSONEncoder)
-        decoder = tooltool.FileRecordJSONDecoder()
-        f = decoder.decode(json_string)
+        decoder = tooltool.ManifestContentJSONDecoder()
+        mft = decoder.decode(json_string)
+        self.assertEqual(len(mft.files), 1)
+        f = mft.files[0]
         for i in ['filename', 'size', 'algorithm', 'digest', 'visibility']:
             self.assertEqual(getattr(f, i), self.test_record.__dict__[i])
 
@@ -283,14 +285,19 @@ class TestFileRecordJSONCodecs(BaseFileRecordListTest):
         self.test_record.visibility = True
         json_string = json.dumps(
             self.test_record, cls=tooltool.FileRecordJSONEncoder)
-        decoder = tooltool.FileRecordJSONDecoder()
-        f = decoder.decode(json_string)
+        decoder = tooltool.ManifestContentJSONDecoder()
+        f = decoder.decode(json_string).files[0]
         for i in ['filename', 'size', 'algorithm', 'digest', 'visibility']:
             self.assertEqual(getattr(f, i), self.test_record.__dict__[i])
 
     def test_decode_dict_not_filerecord(self):
-        decoder = tooltool.FileRecordJSONDecoder()
-        eq_(decoder.decode('{"filename": "foo.txt"}'), {'filename': 'foo.txt'})
+        decoder = tooltool.ManifestContentJSONDecoder()
+        eq_(decoder.decode('{"filename": "foo.txt"}').files[0],
+            {'filename': 'foo.txt'})
+
+    def test_decode_not_dict(self):
+        decoder = tooltool.ManifestContentJSONDecoder()
+        eq_(decoder.decode('[ "blort" ]').files, [ "blort" ])
 
     def test_json_dumps(self):
         json_string = json.dumps(
@@ -304,7 +311,7 @@ class TestFileRecordJSONCodecs(BaseFileRecordListTest):
         json_string = json.dumps(
             self.test_record, cls=tooltool.FileRecordJSONEncoder)
         from_json = json.loads(json_string,
-                               cls=tooltool.FileRecordJSONDecoder)
+                               cls=tooltool.ManifestContentJSONDecoder).files[0]
         for i in ['filename', 'size', 'algorithm', 'digest', 'unpack']:
             self.assertEqual(getattr(from_json, i), getattr(self.test_record, i), i)
 
@@ -314,14 +321,14 @@ class TestFileRecordJSONCodecs(BaseFileRecordListTest):
         json_string = json.dumps(
             self.test_record, cls=tooltool.FileRecordJSONEncoder)
         from_json = json.loads(json_string,
-                               cls=tooltool.FileRecordJSONDecoder)
+                               cls=tooltool.ManifestContentJSONDecoder).files[0]
         for i in ['filename', 'size', 'algorithm', 'digest', 'unpack', 'setup']:
             self.assertEqual(getattr(from_json, i), getattr(self.test_record, i), i)
 
     def test_decode_list(self):
         json_string = json.dumps(
             self.record_list, cls=tooltool.FileRecordJSONEncoder)
-        new_list = json.loads(json_string, cls=tooltool.FileRecordJSONDecoder)
+        new_list = json.loads(json_string, cls=tooltool.ManifestContentJSONDecoder).files
         self.assertEquals(len(new_list), len(self.record_list))
         for record in range(0, len(self.record_list)):
             self.assertEqual(new_list[record], self.record_list[record])
@@ -1581,3 +1588,51 @@ class ListManifest(BaseManifestTest):
     def test_list_invalid_manifest(self):
         open("manifest.tt", "w").write("BOGUS")
         assert not tooltool.list_manifest("manifest.tt")
+
+
+class TestMultiManifest(TestManifest):
+
+    def setUp(self):
+        BaseFileRecordTest.setUp(self)
+
+        # Create a second manifest file and include it in the first. And for
+        # 100% test coverage, make a third to include from the second.
+        self.other_sample_file = 'other-%s' % self.sample_file
+        if os.path.exists(self.other_sample_file):
+            os.remove(self.other_sample_file)
+        shutil.copyfile(self.sample_file, self.other_sample_file)
+
+        self.sample_file_3 = 'gripping-%s' % self.sample_file
+        if os.path.exists(self.sample_file_3):
+            os.remove(self.sample_file_3)
+        shutil.copyfile(self.sample_file, self.sample_file_3)
+
+        self.other_test_record = copy.deepcopy(self.test_record)
+        self.other_test_record.filename = self.other_sample_file
+        self.test_record_3 = copy.deepcopy(self.test_record)
+        self.test_record_3.filename = self.sample_file_3
+        self.test_manifest = tooltool.Manifest([self.test_record])
+        self.test_submanifest = tooltool.Manifest([self.other_test_record])
+        self.test_subsubmanifest = tooltool.Manifest([self.test_record_3])
+        
+        _, self.manifest_file = tempfile.mkstemp()
+        _, self.submanifest_file = tempfile.mkstemp()
+        _, self.subsubmanifest_file = tempfile.mkstemp()
+        with open(self.manifest_file, "w") as fh:
+            self.test_manifest.dump(fh, includes=[self.submanifest_file])
+        with open(self.submanifest_file, "w") as fh:
+            self.test_submanifest.dump(fh, includes=[self.subsubmanifest_file])
+        with open(self.subsubmanifest_file, "w") as fh:
+            self.test_subsubmanifest.dump(fh)
+
+        # Load the new manifest.
+        self.test_manifest = tooltool.Manifest()
+        with open(self.manifest_file) as fh:
+            self.test_manifest.load(fh)
+
+    def tearDown(self):
+        TestManifest.tearDown(self)
+        os.remove(self.manifest_file)
+        os.remove(self.submanifest_file)
+        os.remove(self.subsubmanifest_file)
+        os.remove(self.sample_file_3)
